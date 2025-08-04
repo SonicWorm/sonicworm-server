@@ -20,7 +20,7 @@ const gameContract = new ethers.Contract(process.env.VITE_GAME_CONTRACT_ADDRESS_
 console.log(`✅ Server connected to GameLogic contract at ${gameContract.target}`);
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = parseInt(process.env.PORT) || 8080;
 
 // Security middleware
 app.use(helmet());
