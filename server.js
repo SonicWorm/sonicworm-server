@@ -624,9 +624,16 @@ class GameRoom {
   }
 }
 
-// WebSocket Server
+// Start HTTP server first
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Sonic Snake Server running on port ${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`📈 Stats: http://localhost:${PORT}/stats`);
+});
+
+// WebSocket Server - same port as HTTP
 const wss = new WebSocket.Server({ 
-  port: PORT + 1,
+  server: server,
   verifyClient: (info) => {
     // Rate limiting check
     return true; // Basit implementasyon
@@ -985,12 +992,7 @@ app.get('/stats', (req, res) => {
   res.json(stats);
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Sonic Snake Server running on port ${PORT}`);
-  console.log(`🎮 WebSocket server running on port ${PORT + 1}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
-  console.log(`📈 Stats: http://localhost:${PORT}/stats`);
-});
+// Server already started above with WebSocket
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
