@@ -191,12 +191,25 @@ class GameRoom {
   }
 
   startGame() {
+    console.log('🐛 STARTING GAME - Before:', { 
+      isActive: this.gameState.isActive, 
+      playersCount: this.players.size,
+      startTime: this.gameState.startTime 
+    });
+    
     this.gameState.isActive = true;
     this.gameState.startTime = Date.now();
     
     // Initialize food when game starts
     this.gameState.food = [];
     this.generateFood(GAME_CONFIG.FOOD_COUNT); // Generate initial food
+    
+    console.log('🐛 STARTING GAME - After:', { 
+      isActive: this.gameState.isActive, 
+      playersCount: this.players.size,
+      startTime: this.gameState.startTime,
+      foodCount: this.gameState.food.length
+    });
     
     console.log(`🎮 Game started in room ${this.id} with ${this.gameState.food.length} food items`);
     
