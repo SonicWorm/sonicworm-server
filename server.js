@@ -632,27 +632,10 @@ class GameRoom {
   getGameState() {
     // Clean player data - remove WebSocket references for JSON serialization
     const rawPlayers = Array.from(this.players.values());
-    console.log('🐛 RAW PLAYERS BEFORE CLEAN:', rawPlayers.length, rawPlayers.map(p => ({ 
-      id: p.id, 
-      x: p.x, 
-      y: p.y, 
-      isAlive: p.isAlive, 
-      kills: p.kills,
-      hasWs: !!p.ws 
-    })));
-    
     const cleanPlayers = rawPlayers.map(player => {
       const { ws, ...cleanPlayer } = player; // Remove ws property
       return cleanPlayer;
     });
-    
-    console.log('🐛 CLEAN PLAYERS AFTER CLEAN:', cleanPlayers.length, cleanPlayers.map(p => ({ 
-      id: p.id, 
-      x: p.x, 
-      y: p.y, 
-      isAlive: p.isAlive, 
-      kills: p.kills 
-    })));
     
     const gameState = {
       players: cleanPlayers,
@@ -663,13 +646,6 @@ class GameRoom {
         Math.max(0, GAME_CONFIG.GAME_DURATION - (Date.now() - this.gameState.startTime)) : 0,
       prizePool: this.calculatePrizePool()
     };
-    
-    console.log('🐛 FINAL GAME STATE:', { 
-      playersCount: gameState.players.length, 
-      foodCount: gameState.food.length, 
-      isActive: gameState.isActive,
-      timeRemaining: gameState.timeRemaining
-    });
     
     return gameState;
   }
