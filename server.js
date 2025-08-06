@@ -614,8 +614,14 @@ class GameRoom {
   }
 
   getGameState() {
+    // Clean player data - remove WebSocket references for JSON serialization
+    const cleanPlayers = Array.from(this.players.values()).map(player => {
+      const { ws, ...cleanPlayer } = player; // Remove ws property
+      return cleanPlayer;
+    });
+    
     return {
-      players: Array.from(this.players.values()),
+      players: cleanPlayers,
       food: this.gameState.food,
       isActive: this.gameState.isActive,
       startTime: this.gameState.startTime,
