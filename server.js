@@ -20,7 +20,7 @@ const gameContract = new ethers.Contract(process.env.VITE_GAME_CONTRACT_ADDRESS_
 console.log(`✅ Server connected to GameLogic contract at ${gameContract.target}`);
 
 const app = express();
-const PORT = parseInt(process.env.PORT) || 8080;
+const PORT = parseInt(process.env.PORT) || 8081;
 
 // Security middleware
 app.use(helmet());
@@ -50,6 +50,8 @@ let lobbyState = 'idle'; // 'idle', 'gathering', 'waiting', 'confirming'
 let confirmationTimer = null;
 let lobbyTimeoutId = null; // setTimeout ID'si
 let lobbyIntervalId = null; // setInterval ID'si
+let confirmationTimeoutId = null; // confirmation setTimeout ID'si
+let confirmationIntervalId = null; // confirmation setInterval ID'si
 // ------------------------------------
 
 // SENİN KURALLARIN: Oyun sabitleri
@@ -759,16 +761,42 @@ wss.on('connection', (ws, req) => {
           lobby.delete(playerId);
           console.log(`🚪 Player ${playerId} left. Total: ${lobby.size}`);
           
-          // ESKİ ÇALIŞAn SİSTEM MANTIĞI: Oyuncu sayısına göre durumu güncelle
-          if (lobby.size < 2 && lobbyState === 'waiting') {
-            // Oyuncu sayısı 2'nin altına düştüyse ve sayaç çalışıyorsa, durdur!
-            console.log('✋ Player count dropped below 2, stopping timer.');
+          // UPDATED: Handle timer reset for all lobby states
+          if (lobby.size < 2) {
+            if (lobbyState === 'waiting') {
+              // Stop waiting timer
+              console.log('✋ Player count dropped below 2, stopping waiting timer.');
+              clearTimeout(lobbyTimeoutId);
+              clearInterval(lobbyIntervalId);
+              lobbyTimer = null;
+              lobbyState = lobby.size === 1 ? 'gathering' : 'idle';
+            } else if (lobbyState === 'confirming') {
+              // Stop confirmation timer
+              console.log('✋ Player count dropped below 2 during confirmation, canceling match.');
+              clearTimeout(confirmationTimeoutId);
+              clearInterval(confirmationIntervalId);
+              confirmationTimer = null;
+              lobbyState = lobby.size === 1 ? 'gathering' : 'idle';
+              
+              // Notify remaining players
+              lobby.forEach(player => {
+                if (player.ws.readyState === WebSocket.OPEN) {
+                  player.ws.send(JSON.stringify({
+                    type: 'MATCH_CANCELED',
+                    message: 'Match canceled - not enough players'
+                  }));
+                }
+              });
+            }
+          } else if (lobby.size === 0) {
+            // Reset all timers when lobby is empty
             clearTimeout(lobbyTimeoutId);
             clearInterval(lobbyIntervalId);
-            lobbyTimer = null;
-            lobbyState = lobby.size === 1 ? 'gathering' : 'idle';
-          } else if (lobby.size === 0) {
+            clearTimeout(confirmationTimeoutId);
+            clearInterval(confirmationIntervalId);
             lobbyState = 'idle';
+            lobbyTimer = null;
+            confirmationTimer = null;
           }
           broadcastLobbyStatus();
           break;
@@ -870,14 +898,39 @@ wss.on('connection', (ws, req) => {
       lobby.delete(playerId);
       
       // Lobby durumunu güncelle
-      if (lobby.size < 2 && lobbyState === 'waiting') {
-        console.log('✋ Player count dropped below 2 due to disconnect, stopping timer.');
+      if (lobby.size < 2) {
+        if (lobbyState === 'waiting') {
+          console.log('✋ Player count dropped below 2 due to disconnect, stopping waiting timer.');
+          clearTimeout(lobbyTimeoutId);
+          clearInterval(lobbyIntervalId);
+          lobbyTimer = null;
+          lobbyState = lobby.size === 1 ? 'gathering' : 'idle';
+        } else if (lobbyState === 'confirming') {
+          console.log('✋ Player count dropped below 2 during confirmation due to disconnect, canceling match.');
+          clearTimeout(confirmationTimeoutId);
+          clearInterval(confirmationIntervalId);
+          confirmationTimer = null;
+          lobbyState = lobby.size === 1 ? 'gathering' : 'idle';
+          
+          // Notify remaining players
+          lobby.forEach(player => {
+            if (player.ws.readyState === WebSocket.OPEN) {
+              player.ws.send(JSON.stringify({
+                type: 'MATCH_CANCELED',
+                message: 'Match canceled - not enough players'
+              }));
+            }
+          });
+        }
+      } else if (lobby.size === 0) {
+        // Reset all timers when lobby is empty
         clearTimeout(lobbyTimeoutId);
         clearInterval(lobbyIntervalId);
-        lobbyTimer = null;
-        lobbyState = lobby.size === 1 ? 'gathering' : 'idle';
-      } else if (lobby.size === 0) {
+        clearTimeout(confirmationTimeoutId);
+        clearInterval(confirmationIntervalId);
         lobbyState = 'idle';
+        lobbyTimer = null;
+        confirmationTimer = null;
       }
       broadcastLobbyStatus();
     }
@@ -1060,16 +1113,16 @@ function startMatchmaking() {
   confirmationTimer = Date.now();
 
   // Her saniye durumu yayınla
-  const interval = setInterval(() => {
+  confirmationIntervalId = setInterval(() => {
     if (lobbyState !== 'confirming') {
-      clearInterval(interval);
+      clearInterval(confirmationIntervalId);
       return;
     }
     broadcastLobbyStatus();
   }, 1000);
 
   // 15 saniyelik onay sayacı başlat
-  setTimeout(async () => {
+  confirmationTimeoutId = setTimeout(async () => {
     // confirmedPlayers'ı hem ID hem de player verisi içerecek şekilde alıyoruz
     const confirmedPlayers = Array.from(lobby.entries())
       .filter(([id, player]) => player.confirmed)
@@ -1085,6 +1138,32 @@ function startMatchmaking() {
         console.log(`[Blockchain] Attempting to start match for: ${playerAddresses.join(", ")}`);
         console.log(`[Blockchain] With gameIds: ${gameIds.join(", ")}`);
         
+        // Debug: Check each player's status before starting match
+        for (let i = 0; i < playerAddresses.length; i++) {
+          const playerAddr = playerAddresses[i];
+          const gameId = gameIds[i];
+          
+          try {
+            const playerInfo = await gameContract.getPlayer(playerAddr);
+            const gameInfo = await gameContract.getGame(gameId);
+            
+            console.log(`[Debug] Player ${playerAddr}:`, {
+              lives: playerInfo.lives.toString(),
+              isActive: playerInfo.isActive,
+              currentGameId: playerInfo.currentGameId.toString()
+            });
+            
+            console.log(`[Debug] Game ${gameId}:`, {
+              player: gameInfo.player,
+              isReserved: gameInfo.isReserved,
+              lifeConsumed: gameInfo.lifeConsumed,
+              isCompleted: gameInfo.isCompleted
+            });
+          } catch (debugError) {
+            console.error(`[Debug] Failed to get info for ${playerAddr}/${gameId}:`, debugError.message);
+          }
+        }
+        
         // YENİ V2: startMatch fonksiyonunu gameIds ile çağır
         const tx = await gameContract.startMatch(playerAddresses, gameIds, {
           gasLimit: 500000
@@ -1092,6 +1171,12 @@ function startMatchmaking() {
         console.log(`[Blockchain] Transaction sent: ${tx.hash}. Waiting for confirmation...`);
         await tx.wait();
         console.log(`✅ [Blockchain] Match successfully started on-chain with life consumption!`);
+        
+        // Clear confirmation timers
+        clearInterval(confirmationIntervalId);
+        confirmationTimeoutId = null;
+        confirmationIntervalId = null;
+        
         // SADECE KONTRAKT BAŞARILI OLURSA OYUNU SUNUCUDA BAŞLAT
         createGameFromLobby(confirmedPlayers);
       } catch (error) {
@@ -1106,6 +1191,11 @@ function startMatchmaking() {
             }));
           }
         });
+        // Clear confirmation timers
+        clearInterval(confirmationIntervalId);
+        confirmationTimeoutId = null;
+        confirmationIntervalId = null;
+        
         // Lobiyi temizle
         lobby.clear();
         lobbyTimer = null;
@@ -1165,6 +1255,11 @@ function startMatchmaking() {
       lobbyTimer = null;
       confirmationTimer = null;
     }
+    
+    // Clear confirmation timers
+    clearInterval(confirmationIntervalId);
+    confirmationTimeoutId = null;
+    confirmationIntervalId = null;
   }, 15000); // Onay süresini 15 saniyeye çıkardık
 }
 
