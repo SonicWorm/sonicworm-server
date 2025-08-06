@@ -368,7 +368,7 @@ class GameRoom {
           this.broadcast({
             type: 'GAME_STATE_UPDATE',
             gameState: this.getGameState(),
-            players: Array.from(this.players.values()),
+            players: this.getGameState().players, // Use cleaned players
             connectedCount: this.players.size,
             prizePool: this.calculatePrizePool()
           });
@@ -426,12 +426,15 @@ class GameRoom {
     
     // ✅ Broadcast timer update every 1 second (not every 5 seconds)
     if (elapsedTime % 1000 < 20) { // Every ~1 second (20ms tolerance for 60fps)
+      // Clean game state for broadcast (no WebSocket references)
+      const cleanGameState = this.getGameState(); // Already cleaned in getGameState method
+      
       this.broadcast({
         type: 'TIMER_UPDATE',
         timeRemaining: timeRemaining,
         elapsedTime: elapsedTime,
-        gameState: this.getGameState(),
-        players: Array.from(this.players.values()),
+        gameState: cleanGameState,
+        players: cleanGameState.players, // Use already cleaned players
         connectedCount: this.players.size,
         prizePool: this.calculatePrizePool()
       });
@@ -484,7 +487,7 @@ class GameRoom {
               victimId: player.id,
               killerKills: otherPlayer.kills,
               gameState: this.getGameState(),
-              players: Array.from(this.players.values()),
+              players: this.getGameState().players, // Use cleaned players
               connectedCount: this.players.size,
               prizePool: this.calculatePrizePool()
             });
@@ -871,7 +874,7 @@ wss.on('connection', (ws, req) => {
                 killerId: playerId,
                 victimId: data.victimId,
                 gameState: currentRoom.getGameState(),
-                players: Array.from(currentRoom.players.values()),
+                players: currentRoom.getGameState().players, // Use cleaned players
                 connectedCount: currentRoom.players.size,
                 prizePool: currentRoom.calculatePrizePool()
               });
@@ -1359,7 +1362,7 @@ async function endMatch(room) {
   room.broadcast({
     type: 'GAME_ENDED',
     gameState: room.getGameState(),
-    players: Array.from(room.players.values()),
+    players: room.getGameState().players, // Use cleaned players
     finalLeaderboard: finalLeaderboard,
     prizePool: room.calculatePrizePool(),
     prizeDistribution: prizeDistribution,
