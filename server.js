@@ -145,6 +145,18 @@ class GameRoom {
       this.startGame();
     }
 
+    // 🎯 YENİ: Diğer oyunculara yeni oyuncuyu duyur
+    const newPlayer = this.players.get(playerId);
+    const { ws, ...playerDataWithoutWs } = newPlayer; // WebSocket referansını kaldır
+    
+    this.broadcast({
+      type: 'PLAYER_JOINED',
+      playerId: playerId,
+      playerData: playerDataWithoutWs
+    }, playerId); // Kendisine gönderme
+
+    console.log(`📢 Broadcasting PLAYER_JOINED for ${playerId} to ${this.players.size - 1} other players`);
+
     return true;
   }
 
@@ -169,6 +181,16 @@ class GameRoom {
   }
 
   removePlayer(playerId) {
+    // 🎯 YENİ: Oyuncu ayrılmadan önce diğerlerine haber ver
+    if (this.players.has(playerId)) {
+      this.broadcast({
+        type: 'PLAYER_LEFT',
+        playerId: playerId
+      }, playerId); // Kendisine gönderme
+      
+      console.log(`📢 Broadcasting PLAYER_LEFT for ${playerId} to ${this.players.size - 1} other players`);
+    }
+    
     this.players.delete(playerId);
     
     // Oda boşsa oyunu durdur
@@ -178,8 +200,13 @@ class GameRoom {
     }
   }
 
-  broadcast(message) {
-    this.players.forEach(player => {
+  broadcast(message, excludePlayerId = null) {
+    this.players.forEach((player, playerId) => {
+      // Hariç tutulan oyuncuya gönderme
+      if (excludePlayerId && playerId === excludePlayerId) {
+        return;
+      }
+      
       if (player.ws && player.ws.readyState === 1) { // WebSocket.OPEN = 1
         try {
           player.ws.send(JSON.stringify(message));
