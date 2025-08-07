@@ -892,16 +892,43 @@ wss.on('connection', (ws, req) => {
           
         case 'PLAYER_UPDATE':
           if (currentRoom && data.playerData) {
-            // Minimal position validation
+            // 🎯 CHECKPOINT 1: Enhanced server validation with reconciliation
             const pos = data.playerData;
             if (pos.x >= 0 && pos.x <= GAME_CONFIG.WORLD_SIZE && pos.y >= 0 && pos.y <= GAME_CONFIG.WORLD_SIZE) {
-              currentRoom.updatePlayer(playerId, data.playerData);
+              // Store timestamp and input sequence for reconciliation
+              const updateData = {
+                ...data.playerData,
+                inputSequence: data.playerData.inputSequence || 0,
+                serverTimestamp: Date.now()
+              };
               
-              // Diğer oyunculara güncellemeyi gönder
+              currentRoom.updatePlayer(playerId, updateData);
+              
+              // Send reconciled position back to client
+              const player = currentRoom.players.get(playerId);
+              if (player && player.ws && player.ws.readyState === 1) {
+                player.ws.send(JSON.stringify({
+                  type: 'PLAYER_UPDATE_ACK',
+                  playerId,
+                  serverPosition: {
+                    x: player.x,
+                    y: player.y,
+                    inputSequence: updateData.inputSequence,
+                    serverTimestamp: updateData.serverTimestamp
+                  }
+                }));
+              }
+              
+              // Broadcast to other players (not including reconciliation data)
               broadcastToRoom(currentRoom.id, {
                 type: 'PLAYER_UPDATE',
                 playerId,
-                playerData: data.playerData
+                playerData: {
+                  x: player?.x,
+                  y: player?.y,
+                  angle: pos.angle,
+                  segments: pos.segments
+                }
               }, playerId);
             }
           }
