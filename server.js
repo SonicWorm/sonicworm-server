@@ -5,9 +5,11 @@ const helmet = require('helmet');
 const { v4: uuidv4 } = require('uuid');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 require('dotenv').config();
+
 // --- KONTROL İÇİN GEÇİCİ KOD ---
 console.log("PRIVATE_KEY .env dosyasından okunuyor mu?:", process.env.PRIVATE_KEY ? "EVET, OKUNUYOR" : "HAYIR, OKUNAMIYOR veya BOŞ");
 // --- KONTROL KODU BİTTİ ---
+
 const { ethers } = require("ethers");
 // GameLogic.sol'un ABI'si (Application Binary Interface) buraya gelecek.
 // Bu, kontratın fonksiyonlarını JavaScript'e çeviren uzun bir JSON dizisidir.
@@ -19,13 +21,14 @@ const gameContract = new ethers.Contract(process.env.VITE_GAME_CONTRACT_ADDRESS_
 
 console.log(`✅ Server connected to GameLogic contract at ${gameContract.target}`);
 
+
 const app = express();
-const PORT = parseInt(process.env.PORT) || 8081;
+const PORT = process.env.PORT || 8080;
 
 // Security middleware
 app.use(helmet());
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+  origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000', 'http://localhost:5173'],
   credentials: true
 }));
 app.use(express.json());
@@ -39,20 +42,31 @@ const rateLimiter = new RateLimiterMemory({
 
 // Game state
 const gameRooms = new Map();
+let defaultRoomId = null; // ensure players land in the same active room
 const players = new Map();
+
+// Ack throttle state per player
+const ackState = new Map(); // playerId -> { lastAckAt: number, lastX: number, lastY: number }
+
 const lobby = new Map(); // LOBİDEKİ OYUNCULARI TUTACAK
 let lobbyTimer = null;
 
 // Minimal rate limiting
 const playerMessageCounts = new Map();
+
+
 // --- ÇALIŞAn EŞKİ SİSTEM LOBİ DEĞİŞKENLERİ ---
 let lobbyState = 'idle'; // 'idle', 'gathering', 'waiting', 'confirming'
 let confirmationTimer = null;
+
 let lobbyTimeoutId = null; // setTimeout ID'si
 let lobbyIntervalId = null; // setInterval ID'si
-let confirmationTimeoutId = null; // confirmation setTimeout ID'si
-let confirmationIntervalId = null; // confirmation setInterval ID'si
+
+// Confirmation phase timers (new)
+let confirmationTimeoutId = null;
+let confirmationIntervalId = null;
 // ------------------------------------
+
 
 // SENİN KURALLARIN: Oyun sabitleri
 const GAME_CONFIG = {
@@ -61,6 +75,7 @@ const GAME_CONFIG = {
   GAME_DURATION: 5 * 60 * 1000, // 5 dakika
   FOOD_COUNT: 375 // Updated to 375
 };
+
 
 // SENİN İSTEĞİN: 10-15 farklı oyuncu rengi
 const PLAYER_COLORS = [
@@ -81,6 +96,7 @@ const PLAYER_COLORS = [
   0xc44569  // Dark Pink
 ];
 
+
 class GameRoom {
   constructor(id) {
     this.id = id;
@@ -90,6 +106,7 @@ class GameRoom {
       startTime: null,
       isActive: false
     };
+
     // Minimal güvenlik: Kill protection only
     this.killLock = new Set();
     this.generateFood();
@@ -124,7 +141,7 @@ class GameRoom {
     const safeX = spawnMargin + Math.random() * (GAME_CONFIG.WORLD_SIZE - 2 * spawnMargin);
     const safeY = spawnMargin + Math.random() * (GAME_CONFIG.WORLD_SIZE - 2 * spawnMargin);
     
-    // Initialize segments with minimum segments for immediate visibility
+    // Initialize segments with minimum segments
     const MIN_SEGMENTS = 5;
     const SEGMENT_SIZE = 8;
     const segments = [];
@@ -145,9 +162,12 @@ class GameRoom {
       isAlive: true,
       color: assignedColor, // SENİN İSTEĞİN: Atanmış renk
       joinTime: Date.now(),
-      walletAddress: playerData.walletAddress || null, // YENİ: Cüzdan adresi
+      walletAddress: playerData.walletAddress || null, // YENİN: Cüzdan adresi
       gameId: playerData.gameId || null, // YENİ: Oyun ID'si
       ws: playerData.ws || null, // WebSocket referansı
+      foodEatenCount: 0, // Food eaten counter for growth
+      spawnTime: Date.now(), // Spawn time
+      isInvulnerable: true, // First 10 seconds invulnerable
       ...playerData
     });
 
@@ -155,17 +175,6 @@ class GameRoom {
     if (this.players.size === 1 && !this.gameState.isActive) {
       this.startGame();
     }
-
-    // 🎯 YENİ: Diğer oyunculara yeni oyuncuyu duyur
-    const newPlayer = this.players.get(playerId);
-    const { ws, ...playerDataWithoutWs } = newPlayer; // WebSocket referansını kaldır
-    
-    this.broadcast({
-      type: 'PLAYER_JOINED',
-      player: playerDataWithoutWs
-    }, playerId); // Kendisine gönderme
-
-    console.log(`📢 Broadcasting PLAYER_JOINED for ${playerId} to ${this.players.size - 1} other players`);
 
     return true;
   }
@@ -191,16 +200,6 @@ class GameRoom {
   }
 
   removePlayer(playerId) {
-    // 🎯 YENİ: Oyuncu ayrılmadan önce diğerlerine haber ver
-    if (this.players.has(playerId)) {
-      this.broadcast({
-        type: 'PLAYER_LEFT',
-        playerId: playerId
-      }, playerId); // Kendisine gönderme
-      
-      console.log(`📢 Broadcasting PLAYER_LEFT for ${playerId} to ${this.players.size - 1} other players`);
-    }
-    
     this.players.delete(playerId);
     
     // Oda boşsa oyunu durdur
@@ -210,13 +209,8 @@ class GameRoom {
     }
   }
 
-  broadcast(message, excludePlayerId = null) {
-    this.players.forEach((player, playerId) => {
-      // Hariç tutulan oyuncuya gönderme
-      if (excludePlayerId && playerId === excludePlayerId) {
-        return;
-      }
-      
+  broadcast(message) {
+    this.players.forEach(player => {
       if (player.ws && player.ws.readyState === 1) { // WebSocket.OPEN = 1
         try {
           player.ws.send(JSON.stringify(message));
@@ -228,25 +222,12 @@ class GameRoom {
   }
 
   startGame() {
-    console.log('🐛 STARTING GAME - Before:', { 
-      isActive: this.gameState.isActive, 
-      playersCount: this.players.size,
-      startTime: this.gameState.startTime 
-    });
-    
     this.gameState.isActive = true;
     this.gameState.startTime = Date.now();
     
     // Initialize food when game starts
     this.gameState.food = [];
     this.generateFood(GAME_CONFIG.FOOD_COUNT); // Generate initial food
-    
-    console.log('🐛 STARTING GAME - After:', { 
-      isActive: this.gameState.isActive, 
-      playersCount: this.players.size,
-      startTime: this.gameState.startTime,
-      foodCount: this.gameState.food.length
-    });
     
     console.log(`🎮 Game started in room ${this.id} with ${this.gameState.food.length} food items`);
     
@@ -259,39 +240,70 @@ class GameRoom {
     // Otomatik yeni oyun başlatma kaldırıldı
   }
 
-  async endGame() {
+  endGame() {
     this.gameState.isActive = false;
     
-    // ✅ FIX: Tüm oyuncuların kontrat durumunu admin ile reset et
+    // CRITICAL FIX: Non-blocking blockchain calls - don't await, use fire-and-forget
+    const resetPromises = [];
     for (const [playerId, player] of this.players) {
       if (player.gameId && player.walletAddress) {
-        try {
-          console.log(`🔄 Admin resetting game ${player.gameId} for player ${playerId} (${player.walletAddress})`);
-          // Server authority ile admin reset yap
-          await gameContract.adminEmergencyResetPlayer(player.walletAddress);
-          console.log(`✅ Player ${playerId} reset successfully`);
-        } catch (error) {
-          console.error(`❌ Failed to reset player ${playerId}:`, error.message);
-        }
+        console.log(`🔍 Checking contract status for player ${playerId} (${player.walletAddress})`);
+        
+        // Fire-and-forget: don't block game loop with blockchain calls
+        setImmediate(() => {
+          gameContract.getPlayer(player.walletAddress)
+            .then((contractPlayer) => {
+              if (contractPlayer.isActive) {
+                console.log(`🔄 Admin resetting active game ${player.gameId} for player ${playerId}`);
+                return gameContract.adminEmergencyResetPlayer(player.walletAddress);
+              } else {
+                console.log(`ℹ️ Player ${playerId} is already inactive in contract, skipping reset`);
+                return Promise.resolve();
+              }
+            })
+            .then(() => console.log(`✅ Player ${playerId} processed successfully`))
+            .catch((error) => console.error(`❌ Failed to process player ${playerId}:`, error.message));
+        });
       }
     }
+    
+    console.log(`🏁 Game ended immediately - blockchain operations running in background`);
+    // Return immediately - don't block game state broadcasts
   }
+
 
   updatePlayer(playerId, updateData) {
     const player = this.players.get(playerId);
     if (player && player.isAlive) {
-      // Immediate position sync for authoritative server
+      // Update basic properties
       if (updateData.x !== undefined) player.x = updateData.x;
-      if (updateData.y !== undefined) player.y = updateData.y;
+      if (updateData.y !== undefined) player.y = updateData.y;  
       if (updateData.angle !== undefined) player.angle = updateData.angle;
       
-      // Ensure head segment follows position to avoid desync/zombie head
-      if (Array.isArray(player.segments) && player.segments.length > 0) {
+      // Update segments with smooth following
+      if (player.segments.length > 0) {
         player.segments[0].x = player.x;
         player.segments[0].y = player.y;
+        
+        const SEGMENT_SIZE = 8;
+        // Smooth segment following
+        for (let i = 1; i < player.segments.length; i++) {
+          const prev = player.segments[i - 1];
+          const curr = player.segments[i];
+
+          const dx = prev.x - curr.x;
+          const dy = prev.y - curr.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+          
+          if (distance > SEGMENT_SIZE) {
+            const ratio = SEGMENT_SIZE / distance;
+            curr.x = prev.x - dx * ratio;
+            curr.y = prev.y - dy * ratio;
+          }
+        }
       }
       
-      // Merge the rest
+      // Update other properties
       Object.assign(player, updateData);
     }
   }
@@ -346,9 +358,9 @@ class GameRoom {
       }
       // --- BİTTİ ---
       
-      // Ölen oyuncuyu oyundan çıkar
-      this.removePlayer(playerId);
-
+      // Ölen oyuncuyu yem haline getir
+      this.createFoodFromPlayer(player);
+      
       // Ölen oyuncuya game over mesajı gönder
       if (player.ws && player.ws.readyState === WebSocket.OPEN) {
         player.ws.send(JSON.stringify({
@@ -357,8 +369,6 @@ class GameRoom {
         }));
       }
 
-      // Ölü oyuncuyu yem haline getir
-      this.createFoodFromPlayer(player);
       return true;
     }
     
@@ -426,13 +436,10 @@ class GameRoom {
           // Generate new food
           this.generateFood(1);
           
-          // Broadcast updated game state with full data
+          // Broadcast minimal food delta
           this.broadcast({
-            type: 'GAME_STATE_UPDATE',
-            gameState: this.getGameState(),
-            players: this.getGameState().players, // Use cleaned players
-            connectedCount: this.players.size,
-            prizePool: this.calculatePrizePool()
+            type: 'FOOD_CREATED',
+            newFood: [{ id: foodItem.id, x: foodItem.x, y: foodItem.y, color: foodItem.color, size: foodItem.size }]
           });
         }
       }
@@ -488,17 +495,10 @@ class GameRoom {
     
     // ✅ Broadcast timer update every 1 second (not every 5 seconds)
     if (elapsedTime % 1000 < 20) { // Every ~1 second (20ms tolerance for 60fps)
-      // Clean game state for broadcast (no WebSocket references)
-      const cleanGameState = this.getGameState(); // Already cleaned in getGameState method
-      
       this.broadcast({
         type: 'TIMER_UPDATE',
         timeRemaining: timeRemaining,
-        elapsedTime: elapsedTime,
-        gameState: cleanGameState,
-        players: cleanGameState.players, // Use already cleaned players
-        connectedCount: this.players.size,
-        prizePool: this.calculatePrizePool()
+        elapsedTime: elapsedTime
       });
     }
   }
@@ -507,7 +507,29 @@ class GameRoom {
   // SERVER AUTHORITY: Collision Detection Engine
   checkCollisions() {
     const players = Array.from(this.players.values()).filter(p => p.isAlive);
-    const SEGMENT_SIZE = 8; // Client ile aynı değer
+    const SEGMENT_SIZE = 16; // Daha büyük collision area
+    
+    // Update invulnerability status
+    const currentTime = Date.now();
+    players.forEach(player => {
+      if (player.isInvulnerable) {
+        const invulnerabilityDuration = 10000; // 10 seconds
+        const spawnElapsed = currentTime - (player.spawnTime || player.joinTime);
+        if (spawnElapsed >= invulnerabilityDuration) {
+          player.isInvulnerable = false;
+          console.log(`🛡️ Player ${player.id} invulnerability ended`);
+        }
+      }
+    });
+    
+    // 🔍 DEBUG: Collision check info
+    if (players.length >= 2) {
+      console.log(`🔍 COLLISION CHECK: ${players.length} alive players`);
+      players.forEach(p => {
+        console.log(`  Player ${p.id}: segments=${p.segments?.length || 0}, head=${p.segments?.[0] ? 
+          `(${Math.round(p.segments[0].x)},${Math.round(p.segments[0].y)})` : 'no head'}`);
+      });
+    }
     
     for (let i = 0; i < players.length; i++) {
       const player = players[i];
@@ -534,30 +556,33 @@ class GameRoom {
           
           // Çarpışma tespit edildi
           if (distance < SEGMENT_SIZE) {
-            console.log(`🚨 SERVER COLLISION: ${player.id} hit ${otherPlayer.id}`);
+            // Check if either player is invulnerable
+            if (player.isInvulnerable || otherPlayer.isInvulnerable) {
+              console.log(`🛡️ COLLISION BLOCKED: ${player.id} vs ${otherPlayer.id} - invulnerability active`);
+              continue;
+            }
             
-            // Oyuncuyu öldür
-            player.isAlive = false;
+            console.log(`🚨 SERVER COLLISION: ${player.id} hit ${otherPlayer.id} at distance ${Math.round(distance)}`);
             
-            // Kill sayısını artır
+            // Kill sayısını artır (killPlayer çağrılmadan önce)
             otherPlayer.kills = (otherPlayer.kills || 0) + 1;
             
-            // Client'lara ölüm bildirimi gönder
-            this.broadcast({
-              type: 'PLAYER_KILLED',
-              killerId: otherPlayer.id,
-              victimId: player.id,
-              killerKills: otherPlayer.kills,
-              gameState: this.getGameState(),
-              players: this.getGameState().players, // Use cleaned players
-              connectedCount: this.players.size,
-              prizePool: this.calculatePrizePool()
-            });
+            // 🎯 killPlayer fonksiyonunu çağır - Bu yem yaratma, broadcast vs. yapacak
+            const killed = this.killPlayer(player.id, otherPlayer.id);
             
-            // Blockchain'e kill kaydı (async)
-            this.recordKillToBlockchain(otherPlayer, player);
-            
-            return; // Bu oyuncu öldü, diğer çarpışmaları kontrol etme
+            if (killed) {
+              console.log(`💀 Player ${player.id} killed by ${otherPlayer.id} (kills: ${otherPlayer.kills})`);
+              
+              // BROADCAST THE KILL TO THE ROOM
+              this.broadcast({
+                  type: 'PLAYER_KILLED',
+                  killerId: otherPlayer.id,
+                  victimId: player.id,
+                  gameState: this.getGameState() // Include updated state
+              });
+              
+              return; // Bu oyuncu öldü, diğer çarpışmaları kontrol etme
+            }
           }
         }
       }
@@ -679,37 +704,48 @@ class GameRoom {
   }
 
   getGameState() {
-    // Clean player data - remove WebSocket references for JSON serialization
-    const rawPlayers = Array.from(this.players.values());
-    const cleanPlayers = rawPlayers.map(player => {
-      const { ws, ...cleanPlayer } = player; // Remove ws property
-      return cleanPlayer;
+    // CRITICAL FIX: Ensure ALL players are always included with valid data
+    const sanitizedPlayers = Array.from(this.players.values()).map((p) => {
+      // Ensure head segment always matches current position
+      let segments = Array.isArray(p.segments) ? p.segments : [];
+      if (segments.length > 0) {
+        segments[0].x = p.x;
+        segments[0].y = p.y;
+      }
+      
+      return {
+        id: p.id,
+        x: p.x || 1250,  // Force valid position
+        y: p.y || 1250,  // Force valid position
+        angle: p.angle || 0,
+        // CRITICAL: Ensure segments head matches position
+        segments: segments,
+        segmentCount: segments.length,
+        kills: p.kills || 0,
+        isAlive: p.isAlive !== false,  // Force true unless explicitly false
+        color: p.color || 0x00ffcc,
+        spawnTime: p.spawnTime || Date.now(),
+        isInvulnerable: p.isInvulnerable || false,
+        walletAddress: p.walletAddress || null
+      };
     });
-    
-    const gameState = {
-      players: cleanPlayers,
+
+    return {
+      players: sanitizedPlayers,
       food: this.gameState.food,
       isActive: this.gameState.isActive,
       startTime: this.gameState.startTime,
-      timeRemaining: this.gameState.startTime ? 
+      timeRemaining: this.gameState.startTime ?
         Math.max(0, GAME_CONFIG.GAME_DURATION - (Date.now() - this.gameState.startTime)) : 0,
       prizePool: this.calculatePrizePool()
     };
-    
-    return gameState;
   }
 }
 
-// Start HTTP server first
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Sonic Snake Server running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
-  console.log(`📈 Stats: http://localhost:${PORT}/stats`);
-});
-
-// WebSocket Server - same port as HTTP
+// WebSocket Server  
+const WS_PORT = parseInt(PORT) + 1;
 const wss = new WebSocket.Server({ 
-  server: server,
+  port: WS_PORT,
   verifyClient: (info) => {
     // Rate limiting check
     return true; // Basit implementasyon
@@ -805,29 +841,28 @@ wss.on('connection', (ws, req) => {
           
           // V3: Emergency reset (güvenli çözüm)
           if (leavingPlayer && leavingPlayer.playerData?.walletAddress) {
-            try {
-              console.log(`🔄 Emergency reset for leaving player ${playerId} (${leavingPlayer.playerData.walletAddress})`);
-              await gameContract.adminEmergencyResetPlayer(leavingPlayer.playerData.walletAddress);
-              console.log(`✅ Player ${playerId} reset successfully on leave queue`);
-              
-              // Frontend'e bilgi gönder
-              if (leavingPlayer.ws.readyState === WebSocket.OPEN) {
-                leavingPlayer.ws.send(JSON.stringify({
-                  type: 'PLAYER_RESET',
-                  message: 'You have been reset and can rejoin games'
-                }));
-              }
-            } catch (error) {
-              console.error(`❌ Failed to reset leaving player ${playerId}:`, error.message);
-              
-              // Hata olsa bile kullanıcıya bildir
-              if (leavingPlayer.ws && leavingPlayer.ws.readyState === WebSocket.OPEN) {
-                leavingPlayer.ws.send(JSON.stringify({
-                  type: 'ERROR',
-                  message: 'Player reset failed - Blockchain error'
-                }));
-              }
-            }
+            // Fire-and-forget: blockchain çağrısını event döngüsünü bloklamadan yap
+            console.log(`🔄 Emergency reset for leaving player ${playerId} (${leavingPlayer.playerData.walletAddress})`);
+            void gameContract
+              .adminEmergencyResetPlayer(leavingPlayer.playerData.walletAddress)
+              .then(() => {
+                console.log(`✅ Player ${playerId} reset successfully on leave queue`);
+                if (leavingPlayer.ws.readyState === WebSocket.OPEN) {
+                  leavingPlayer.ws.send(JSON.stringify({
+                    type: 'PLAYER_RESET',
+                    message: 'You have been reset and can rejoin games'
+                  }));
+                }
+              })
+              .catch((error) => {
+                console.error(`❌ Failed to reset leaving player ${playerId}:`, error.message);
+                if (leavingPlayer.ws && leavingPlayer.ws.readyState === WebSocket.OPEN) {
+                  leavingPlayer.ws.send(JSON.stringify({
+                    type: 'ERROR',
+                    message: 'Player reset failed - Blockchain error'
+                  }));
+                }
+              });
           } else {
             console.log(`⚠️ No wallet address found for leaving player ${playerId}`);
           }
@@ -838,20 +873,18 @@ wss.on('connection', (ws, req) => {
           // UPDATED: Handle timer reset for all lobby states
           if (lobby.size < 2) {
             if (lobbyState === 'waiting') {
-              // Stop waiting timer
               console.log('✋ Player count dropped below 2, stopping waiting timer.');
               clearTimeout(lobbyTimeoutId);
               clearInterval(lobbyIntervalId);
               lobbyTimer = null;
               lobbyState = lobby.size === 1 ? 'gathering' : 'idle';
             } else if (lobbyState === 'confirming') {
-              // Stop confirmation timer
               console.log('✋ Player count dropped below 2 during confirmation, canceling match.');
               clearTimeout(confirmationTimeoutId);
               clearInterval(confirmationIntervalId);
               confirmationTimer = null;
               lobbyState = lobby.size === 1 ? 'gathering' : 'idle';
-              
+
               // Notify remaining players
               lobby.forEach(player => {
                 if (player.ws.readyState === WebSocket.OPEN) {
@@ -886,10 +919,50 @@ wss.on('connection', (ws, req) => {
           break;
           
         case 'JOIN_GAME':
+          // CRITICAL FIX: Always process JOIN_GAME fully for proper multiplayer sync
+          const existing = players.get(playerId);
+          if (existing && gameRooms.has(existing.roomId)) {
+            const room = gameRooms.get(existing.roomId);
+            // Update WebSocket reference for reconnection
+            existing.ws = ws;
+            // Re-send game state
+            ws.send(JSON.stringify({
+              type: 'GAME_JOINED',
+              playerId,
+              roomId: existing.roomId,
+              gameState: room.getGameState()
+            }));
+            // CRITICAL: Also broadcast PLAYER_JOINED to ensure all clients see this player
+            const p = room.players.get(playerId);
+            if (p) {
+              broadcastToRoom(room.id, {
+                type: 'PLAYER_JOINED',
+                player: {
+                  id: p.id,
+                  x: p.x,
+                  y: p.y,
+                  angle: p.angle,
+                  segmentCount: Array.isArray(p.segments) ? p.segments.length : 0,
+                  kills: p.kills || 0,
+                  isAlive: !!p.isAlive,
+                  color: p.color
+                }
+              }, playerId); // Exclude self from broadcast
+            }
+            break;
+          }
+
           currentRoom = findOrCreateRoom();
           const joined = currentRoom.addPlayer(playerId, data.playerData);
           
+          // Reduced logs for performance
+          
           if (joined) {
+            // Close stale ws if exists for same playerId
+            const prev = players.get(playerId);
+            if (prev && prev.ws && prev.ws.readyState === WebSocket.OPEN) {
+              try { prev.ws.close(); } catch {}
+            }
             players.set(playerId, { ws, roomId: currentRoom.id });
             
             ws.send(JSON.stringify({
@@ -900,9 +973,20 @@ wss.on('connection', (ws, req) => {
             }));
             
             // Diğer oyunculara yeni oyuncu bilgisini gönder
+            const p = currentRoom.players.get(playerId);
             broadcastToRoom(currentRoom.id, {
               type: 'PLAYER_JOINED',
-              player: currentRoom.players.get(playerId)
+              player: {
+                id: p.id,
+                x: p.x,
+                y: p.y,
+                angle: p.angle,
+                segmentCount: Array.isArray(p.segments) ? p.segments.length : 0,
+                kills: p.kills || 0,
+                isAlive: !!p.isAlive,
+                color: p.color,
+                walletAddress: p.walletAddress || null
+              }
             }, playerId);
           } else {
             ws.send(JSON.stringify({
@@ -914,42 +998,46 @@ wss.on('connection', (ws, req) => {
           
         case 'PLAYER_UPDATE':
           if (currentRoom && data.playerData) {
-            // 🎯 CHECKPOINT 1: Enhanced server validation with reconciliation
+            // Minimal position validation
             const pos = data.playerData;
             if (pos.x >= 0 && pos.x <= GAME_CONFIG.WORLD_SIZE && pos.y >= 0 && pos.y <= GAME_CONFIG.WORLD_SIZE) {
-              // Store timestamp and input sequence for reconciliation
-              const updateData = {
-                ...data.playerData,
-                inputSequence: data.playerData.inputSequence || 0,
-                serverTimestamp: Date.now()
-              };
-              
-              currentRoom.updatePlayer(playerId, updateData);
-              
-              // Send reconciled position back to client
+              currentRoom.updatePlayer(playerId, data.playerData);
+
+              // Throttled reconciliation ack to reduce rubber-banding
               const player = currentRoom.players.get(playerId);
-              if (player && player.ws && player.ws.readyState === 1) {
-                player.ws.send(JSON.stringify({
-                  type: 'PLAYER_UPDATE_ACK',
-                  playerId,
-                  serverPosition: {
-                    x: player.x,
-                    y: player.y,
-                    inputSequence: updateData.inputSequence,
-                    serverTimestamp: updateData.serverTimestamp
-                  }
-                }));
+              if (player && ws.readyState === WebSocket.OPEN) {
+                const now = Date.now();
+                const state = ackState.get(playerId) || { lastAckAt: 0, lastX: player.x, lastY: player.y };
+                const dt = now - state.lastAckAt;
+                const dx = Math.abs(player.x - state.lastX);
+                const dy = Math.abs(player.y - state.lastY);
+                const manhattan = dx + dy;
+                // Ack if 1) at least 120ms passed OR 2) movement significant (>10 px)
+                if (dt >= 120 || manhattan > 10) {
+                  ws.send(JSON.stringify({
+                    type: 'PLAYER_UPDATE_ACK',
+                    playerId,
+                    serverPosition: {
+                      x: player.x,
+                      y: player.y,
+                      angle: player.angle,
+                      inputSequence: data.playerData?.inputSequence ?? 0,
+                      serverTimestamp: now
+                    }
+                  }));
+                  ackState.set(playerId, { lastAckAt: now, lastX: player.x, lastY: player.y });
+                }
               }
-              
-              // Broadcast to other players (not including reconciliation data)
+
+              // Broadcast sanitized update to other players
               broadcastToRoom(currentRoom.id, {
                 type: 'PLAYER_UPDATE',
                 playerId,
                 playerData: {
-                  x: player?.x,
-                  y: player?.y,
+                  x: pos.x,
+                  y: pos.y,
                   angle: pos.angle,
-                  segments: pos.segments
+                  segments: Array.isArray(pos.segments) ? pos.segments : []
                 }
               }, playerId);
             }
@@ -957,21 +1045,9 @@ wss.on('connection', (ws, req) => {
           break;
           
         case 'PLAYER_KILL':
-          if (currentRoom) {
-            const killed = await currentRoom.killPlayer(data.victimId, playerId);
-            
-            if (killed) {
-              broadcastToRoom(currentRoom.id, {
-                type: 'PLAYER_KILLED',
-                killerId: playerId,
-                victimId: data.victimId,
-                gameState: currentRoom.getGameState(),
-                players: currentRoom.getGameState().players, // Use cleaned players
-                connectedCount: currentRoom.players.size,
-                prizePool: currentRoom.calculatePrizePool()
-              });
-            }
-          }
+          // REMOVED FOR SECURITY - Kills are now determined exclusively by server-side collision detection.
+          // The client can no longer tell the server it has killed another player.
+          console.log(`⚠️ Received deprecated PLAYER_KILL event from client ${playerId}. Ignoring.`);
           break;
           
         case 'PING':
@@ -998,7 +1074,7 @@ wss.on('connection', (ws, req) => {
       // Life will be automatically available since it was never spent
       lobby.delete(playerId);
       
-      // Lobby durumunu güncelle
+      // Lobby durumunu güncelle (waiting + confirming temizliği)
       if (lobby.size < 2) {
         if (lobbyState === 'waiting') {
           console.log('✋ Player count dropped below 2 due to disconnect, stopping waiting timer.');
@@ -1012,7 +1088,6 @@ wss.on('connection', (ws, req) => {
           clearInterval(confirmationIntervalId);
           confirmationTimer = null;
           lobbyState = lobby.size === 1 ? 'gathering' : 'idle';
-          
           // Notify remaining players
           lobby.forEach(player => {
             if (player.ws.readyState === WebSocket.OPEN) {
@@ -1054,21 +1129,39 @@ wss.on('connection', (ws, req) => {
 });
 
 function findOrCreateRoom() {
-  // Mevcut odaları kontrol et
+  // CRITICAL FIX: Always ensure defaultRoomId points to a valid, non-full room
+  
+  // First: validate defaultRoomId is still usable
+  if (defaultRoomId && gameRooms.has(defaultRoomId)) {
+    const defaultRoom = gameRooms.get(defaultRoomId);
+    if (defaultRoom.players.size < GAME_CONFIG.MAX_PLAYERS_PER_ROOM) {
+      console.log(`🎯 Using existing default room: ${defaultRoomId} (${defaultRoom.players.size}/${GAME_CONFIG.MAX_PLAYERS_PER_ROOM})`);
+      return defaultRoom;
+    } else {
+      // Default room is full, invalidate it
+      console.log(`❌ Default room ${defaultRoomId} is full, invalidating`);
+      defaultRoomId = null;
+    }
+  }
+
+  // Second: scan for ANY available room to become new default
   for (const [roomId, room] of gameRooms) {
     if (room.players.size < GAME_CONFIG.MAX_PLAYERS_PER_ROOM) {
+      defaultRoomId = roomId;
+      console.log(`🔄 Setting new default room: ${roomId} (${room.players.size}/${GAME_CONFIG.MAX_PLAYERS_PER_ROOM})`);
       return room;
     }
   }
-  
-  // Yeni oda oluştur
+
+  // Third: all rooms full, create new room as default
   const roomId = uuidv4();
   const room = new GameRoom(roomId);
   gameRooms.set(roomId, room);
-  
-  console.log(`🏠 New room created: ${roomId}`);
+  defaultRoomId = roomId;
+  console.log(`🏠 Created new default room: ${roomId}`);
   return room;
 }
+
 
 function broadcastToRoom(roomId, message, excludePlayerId = null) {
   const room = gameRooms.get(roomId);
@@ -1084,7 +1177,7 @@ function broadcastToRoom(roomId, message, excludePlayerId = null) {
   });
 }
 
-// Game state broadcast (60 FPS) + COLLISION DETECTION + FOOD SYSTEM + TIMER
+// Game state broadcast (60 Hz) + COLLISION DETECTION + FOOD SYSTEM + TIMER
 setInterval(() => {
   gameRooms.forEach((room) => {
     if (room.gameState.isActive && room.players.size > 0) {
@@ -1093,14 +1186,17 @@ setInterval(() => {
       room.checkFoodCollisions();    // Player vs Food collision  
       room.updateGameTimer();        // Game timer management
       
-      // Broadcast complete game state with real-time data
+      // Broadcast sanitized game state
       const gameState = room.getGameState();
+      
+      // Debug logs removed for performance
+      
       broadcastToRoom(room.id, {
         type: 'GAME_STATE',
         gameState: gameState
       });
-      
-      // Additional UI updates
+
+      // Additional lightweight UI update (optional)
       broadcastToRoom(room.id, {
         type: 'GAME_STATE_UPDATE',
         prizePool: room.calculatePrizePool(),
@@ -1110,7 +1206,8 @@ setInterval(() => {
       });
     }
   });
-}, 1000 / 60); // 60 FPS
+}, 1000 / 60); // 60 FPS for smoother real-time
+
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -1146,7 +1243,13 @@ app.get('/stats', (req, res) => {
   res.json(stats);
 });
 
-// Server already started above with WebSocket
+
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Sonic Snake Server running on port ${PORT}`);
+  console.log(`🎮 WebSocket server running on port ${WS_PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`📈 Stats: http://localhost:${PORT}/stats`);
+});
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
@@ -1162,6 +1265,7 @@ process.on('SIGTERM', () => {
     process.exit(0);
   });
 });
+
 
 // Lobi fonksiyonları - ESKİ ÇALIŞAn SİSTEM
 function broadcastLobbyStatus() {
@@ -1239,32 +1343,6 @@ function startMatchmaking() {
         console.log(`[Blockchain] Attempting to start match for: ${playerAddresses.join(", ")}`);
         console.log(`[Blockchain] With gameIds: ${gameIds.join(", ")}`);
         
-        // Debug: Check each player's status before starting match
-        for (let i = 0; i < playerAddresses.length; i++) {
-          const playerAddr = playerAddresses[i];
-          const gameId = gameIds[i];
-          
-          try {
-            const playerInfo = await gameContract.getPlayer(playerAddr);
-            const gameInfo = await gameContract.getGame(gameId);
-            
-            console.log(`[Debug] Player ${playerAddr}:`, {
-              lives: playerInfo.lives.toString(),
-              isActive: playerInfo.isActive,
-              currentGameId: playerInfo.currentGameId.toString()
-            });
-            
-            console.log(`[Debug] Game ${gameId}:`, {
-              player: gameInfo.player,
-              isReserved: gameInfo.isReserved,
-              lifeConsumed: gameInfo.lifeConsumed,
-              isCompleted: gameInfo.isCompleted
-            });
-          } catch (debugError) {
-            console.error(`[Debug] Failed to get info for ${playerAddr}/${gameId}:`, debugError.message);
-          }
-        }
-        
         // YENİ V2: startMatch fonksiyonunu gameIds ile çağır
         const tx = await gameContract.startMatch(playerAddresses, gameIds, {
           gasLimit: 500000
@@ -1272,12 +1350,6 @@ function startMatchmaking() {
         console.log(`[Blockchain] Transaction sent: ${tx.hash}. Waiting for confirmation...`);
         await tx.wait();
         console.log(`✅ [Blockchain] Match successfully started on-chain with life consumption!`);
-        
-        // Clear confirmation timers
-        clearInterval(confirmationIntervalId);
-        confirmationTimeoutId = null;
-        confirmationIntervalId = null;
-        
         // SADECE KONTRAKT BAŞARILI OLURSA OYUNU SUNUCUDA BAŞLAT
         createGameFromLobby(confirmedPlayers);
       } catch (error) {
@@ -1292,11 +1364,6 @@ function startMatchmaking() {
             }));
           }
         });
-        // Clear confirmation timers
-        clearInterval(confirmationIntervalId);
-        confirmationTimeoutId = null;
-        confirmationIntervalId = null;
-        
         // Lobiyi temizle
         lobby.clear();
         lobbyTimer = null;
@@ -1356,13 +1423,9 @@ function startMatchmaking() {
       lobbyTimer = null;
       confirmationTimer = null;
     }
-    
-    // Clear confirmation timers
-    clearInterval(confirmationIntervalId);
-    confirmationTimeoutId = null;
-    confirmationIntervalId = null;
   }, 15000); // Onay süresini 15 saniyeye çıkardık
 }
+
 
 function createGameFromLobby(confirmedPlayers) {
   console.log(`🎮 Creating game with ${confirmedPlayers.length} players`);
@@ -1433,36 +1496,40 @@ async function endMatch(room) {
   const winners = prizeDistribution.map(p => p.walletAddress);
   const amounts = prizeDistribution.map(p => BigInt(Math.floor(p.prize * 1e18))); // Convert to wei
   
-  // Distribute prizes via blockchain
+  // CRITICAL FIX: Non-blocking prize distribution
   if (winners.length > 0) {
-    try {
-      console.log('🔗 Distributing prizes via smart contract...');
-      console.log('Winners:', winners);
-      console.log('Amounts (S):', amounts.map(a => ethers.formatEther(a)));
-      
-      await gameContract.distributePrizes(winners, amounts);
-      console.log('✅ Prizes distributed to pending rewards successfully');
-    } catch (error) {
-      console.error('❌ Prize distribution failed:', error.message);
-      console.log('⚠️ Game will continue without prize distribution');
-    }
+    console.log('🔗 Starting prize distribution in background...');
+    console.log('Winners:', winners);
+    console.log('Amounts (S):', amounts.map(a => ethers.formatEther(a)));
+    
+    // Fire-and-forget: don't block game ending with blockchain calls
+    setImmediate(() => {
+      gameContract.distributePrizes(winners, amounts)
+        .then(() => {
+          console.log('✅ Prizes distributed to pending rewards successfully');
+        })
+        .catch((error) => {
+          console.error('❌ Prize distribution failed:', error.message);
+          console.log('⚠️ Prize distribution failed but game ended successfully');
+        });
+    });
   } else {
     console.log('⚠️ No winners found - no prize distribution');
   }
   
-  // Broadcast game end event with NEW SYSTEM data
-  room.broadcast({
+  // CRITICAL FIX: Use consistent broadcast method
+  broadcastToRoom(room.id, {
     type: 'GAME_ENDED',
     gameState: room.getGameState(),
-    players: room.getGameState().players, // Use cleaned players
+    players: Array.from(room.players.values()),
     finalLeaderboard: finalLeaderboard,
     prizePool: room.calculatePrizePool(),
     prizeDistribution: prizeDistribution,
     survivors: survivors.length
   });
   
-  // Oyunu bitir
-  await room.endGame();
+  // Oyunu bitir - non-blocking
+  room.endGame();
 }
 
 console.log('🐍 Sonic Snake GameFi Server Started!');
