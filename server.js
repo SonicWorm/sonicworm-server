@@ -162,8 +162,7 @@ class GameRoom {
     
     this.broadcast({
       type: 'PLAYER_JOINED',
-      playerId: playerId,
-      playerData: playerDataWithoutWs
+      player: playerDataWithoutWs
     }, playerId); // Kendisine gönderme
 
     console.log(`📢 Broadcasting PLAYER_JOINED for ${playerId} to ${this.players.size - 1} other players`);
