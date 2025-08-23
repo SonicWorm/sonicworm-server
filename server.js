@@ -124,12 +124,23 @@ class GameRoom {
     const safeX = spawnMargin + Math.random() * (GAME_CONFIG.WORLD_SIZE - 2 * spawnMargin);
     const safeY = spawnMargin + Math.random() * (GAME_CONFIG.WORLD_SIZE - 2 * spawnMargin);
     
+    // Initialize segments with minimum segments for immediate visibility
+    const MIN_SEGMENTS = 5;
+    const SEGMENT_SIZE = 8;
+    const segments = [];
+    for (let i = 0; i < MIN_SEGMENTS; i++) {
+      segments.push({
+        x: safeX - (i * SEGMENT_SIZE),
+        y: safeY
+      });
+    }
+
     this.players.set(playerId, {
       id: playerId,
       x: safeX,
       y: safeY,
       angle: 0,
-      segments: [],
+      segments: segments,
       kills: 0,
       isAlive: true,
       color: assignedColor, // SENİN İSTEĞİN: Atanmış renk
@@ -270,6 +281,18 @@ class GameRoom {
   updatePlayer(playerId, updateData) {
     const player = this.players.get(playerId);
     if (player && player.isAlive) {
+      // Immediate position sync for authoritative server
+      if (updateData.x !== undefined) player.x = updateData.x;
+      if (updateData.y !== undefined) player.y = updateData.y;
+      if (updateData.angle !== undefined) player.angle = updateData.angle;
+      
+      // Ensure head segment follows position to avoid desync/zombie head
+      if (Array.isArray(player.segments) && player.segments.length > 0) {
+        player.segments[0].x = player.x;
+        player.segments[0].y = player.y;
+      }
+      
+      // Merge the rest
       Object.assign(player, updateData);
     }
   }
