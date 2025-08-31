@@ -20,7 +20,7 @@ const gameContract = new ethers.Contract(process.env.VITE_GAME_CONTRACT_ADDRESS_
 console.log(`✅ Server connected to GameLogic contract at ${gameContract.target}`);
 
 const app = express();
-const PORT = parseInt(process.env.PORT) || 8081;
+const PORT = parseInt(process.env.PORT) || 8080;
 
 // Security middleware
 app.use(helmet());
@@ -39,6 +39,7 @@ const rateLimiter = new RateLimiterMemory({
 
 // Game state
 const gameRooms = new Map();
+let defaultRoomId = null; // ensure players land in the same active room
 const players = new Map();
 const lobby = new Map(); // LOBİDEKİ OYUNCULARI TUTACAK
 let lobbyTimer = null;
